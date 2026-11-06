@@ -19,6 +19,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +30,30 @@ import (
 type BackupStream struct {
 	PlaylistID string
 	URL        string
+}
+
+// bufferGeneration is incremented for each new thirdPartyBuffer run.
+var bufferGeneration atomic.Uint64
+
+// bufferRuns maps a buffer key (playlistID + stream MD5) to a channel that is
+// closed when the thirdPartyBuffer run for that key, and every older run for
+// that key, has stopped. A new run for the same key waits on it, so two runs
+// never write to the same buffer folder.
+var bufferRuns sync.Map
+
+// bufferWatchInterval is how often a thirdPartyBuffer run checks whether its
+// clients are gone, independently of whether ffmpeg/VLC is producing data.
+const bufferWatchInterval = 500 * time.Millisecond
+
+// bufferRunWaitTimeout is how long a new thirdPartyBuffer run waits for an older
+// run on the same stream to stop.
+const bufferRunWaitTimeout = 5 * time.Second
+
+// isCurrentBufferRun reports whether a thirdPartyBuffer run still owns its
+// stream: the stream has clients, and no newer run has replaced this one.
+func isCurrentBufferRun(bufferKey string, generation uint64) bool {
+	c, ok := BufferClients.Load(bufferKey)
+	return ok && c.(ClientConnection).Generation == generation
 }
 
 func getActiveClientCount() (count int) {
@@ -358,10 +384,17 @@ func bufferingStream(playlistID string, streamingURL string, backupStream1 *Back
 		BufferInformation.Store(playlistID, playlist)
 		Lock.Unlock()
 
+		// Register the client before starting the buffer, so the buffer run
+		// can read its own generation.
+		var clients ClientConnection
+		clients.Connection = 1
+		clients.Generation = bufferGeneration.Add(1)
+		BufferClients.Store(playlistID+stream.MD5, clients)
+
 		switch playlist.Buffer {
 
 		case "ffmpeg", "vlc":
-			go thirdPartyBuffer(streamID, playlistID, false, 0)
+			go thirdPartyBuffer(streamID, playlistID, false, 0, clients.Generation)
 
 		default:
 			break
@@ -369,10 +402,6 @@ func bufferingStream(playlistID string, streamingURL string, backupStream1 *Back
 		}
 
 		showInfo(fmt.Sprintf("Streaming Status 1:Playlist: %s - Tuner: %d / %d", playlist.PlaylistName, len(playlist.Streams), playlist.Tuner))
-
-		var clients ClientConnection
-		clients.Connection = 1
-		BufferClients.Store(playlistID+stream.MD5, clients)
 
 	}
 
@@ -387,6 +416,18 @@ func bufferingStream(playlistID string, streamingURL string, backupStream1 *Back
 			if stream, ok := playlist.Streams[streamID]; ok {
 
 				if !stream.Status {
+
+					// The buffer watchdog only sees a client leave once it is
+					// unregistered, so do that here too, before the first segment.
+					select {
+
+					case <-r.Context().Done():
+						killClientConnection(streamID, playlistID, false)
+						return
+
+					default:
+
+					}
 
 					timeOut++
 
@@ -1019,7 +1060,7 @@ func switchBandwidth(stream *ThisStream) (err error) {
 }
 
 // Buffer with FFMPEG
-func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNumber int) {
+func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNumber int, generation uint64) {
 
 	if p, ok := BufferInformation.Load(playlistID); ok {
 
@@ -1031,9 +1072,71 @@ func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNum
 		var buf bytes.Buffer
 		var fileSize = 0
 		var streamStatus = make(chan bool)
+		var bufferKey = playlistID + stream.MD5
 
-		var tmpFolder = playlist.Streams[streamID].Folder
-		var url = playlist.Streams[streamID].URL
+		// Wait for an older run for the same stream to stop before this run
+		// clears and reuses the buffer folder. A backup run (useBackup) is
+		// called from inside the first run, so it must not wait on itself.
+		if !useBackup {
+			// Check and swap together, so that bufferRuns keeps the runs in
+			// generation order: a stale run never hides a newer one.
+			Lock.Lock()
+			if !isCurrentBufferRun(bufferKey, generation) {
+				Lock.Unlock()
+				return
+			}
+			var done = make(chan struct{})
+			var prev, loaded = bufferRuns.Swap(bufferKey, done)
+			Lock.Unlock()
+
+			// If the older run is still stopping when this run returns, done
+			// stays open until it has stopped, so the next run waits for it too.
+			defer func() {
+				go func() {
+					if loaded {
+						<-prev.(chan struct{})
+					}
+					close(done)
+					bufferRuns.CompareAndDelete(bufferKey, done)
+				}()
+			}()
+
+			var prevStopped = true
+			if loaded {
+				select {
+				case <-prev.(chan struct{}):
+				case <-time.After(bufferRunWaitTimeout):
+					prevStopped = false
+				}
+			}
+
+			// During the wait, the clients left or a newer run replaced this
+			// run. Do not clear the folder or open an upstream connection.
+			if !isCurrentBufferRun(bufferKey, generation) {
+				if prevStopped {
+					clientConnection(stream)
+				}
+				return
+			}
+
+			// The older run may still be writing to the buffer folder, so do
+			// not share it. The clients stop on the error, and can reconnect.
+			if !prevStopped {
+				var err = errors.New("Previous buffer for this stream did not stop")
+				ShowError(err, 0)
+				Lock.Lock()
+				if c, ok := BufferClients.Load(bufferKey); ok {
+					var clients = c.(ClientConnection)
+					clients.Error = err
+					BufferClients.Store(bufferKey, clients)
+				}
+				Lock.Unlock()
+				return
+			}
+		}
+
+		var tmpFolder = stream.Folder
+		var url = stream.URL
 		if useBackup {
 			if backupNumber >= 1 && backupNumber <= 3 {
 				switch backupNumber {
@@ -1087,7 +1190,7 @@ func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNum
 			if !useBackup || (useBackup && backupNumber >= 0 && backupNumber <= 3) {
 				backupNumber = backupNumber + 1
 				if stream.BackupChannel1 != nil || stream.BackupChannel2 != nil || stream.BackupChannel3 != nil {
-					thirdPartyBuffer(streamID, playlistID, true, backupNumber)
+					thirdPartyBuffer(streamID, playlistID, true, backupNumber, generation)
 				}
 				return
 			}
@@ -1227,6 +1330,41 @@ func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNum
 
 		cmd.Start()
 		defer cmd.Wait()
+
+		// Watchdog: the client check in the read loop below only runs after a
+		// read returns. If the source stalls, the read blocks and the process
+		// keeps its upstream connection open forever, after every client has
+		// left. Check independently, and kill the process when this run has
+		// no clients, or when a newer run for the same stream has replaced it.
+		// Killing the process makes the blocked read return.
+		var abandoned, replaced atomic.Bool
+		var stopWatch = make(chan struct{})
+		defer close(stopWatch)
+
+		go func() {
+			ticker := time.NewTicker(bufferWatchInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopWatch:
+					return
+				case <-ticker.C:
+					c, ok := BufferClients.Load(bufferKey)
+					switch {
+					case !ok:
+						abandoned.Store(true)
+					case c.(ClientConnection).Generation != generation:
+						replaced.Store(true)
+					default:
+						continue
+					}
+					if cmd.Process != nil {
+						cmd.Process.Kill()
+					}
+					return
+				}
+			}
+		}()
 
 		go func() {
 
@@ -1372,6 +1510,19 @@ func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNum
 
 		cmd.Process.Kill()
 		cmd.Wait()
+
+		// Stopped by the watchdog: not a stream error. A replaced run must not
+		// set an error on the shared client entry, or start a backup stream,
+		// because that entry now belongs to the newer run.
+		if replaced.Load() {
+			showInfo(fmt.Sprintf("Streaming Status:Channel: %s - Replaced by a newer buffer, %s stopped", stream.ChannelName, bufferType))
+			return
+		}
+		if abandoned.Load() {
+			showInfo(fmt.Sprintf("Streaming Status:Channel: %s - No client is using this channel anymore, %s stopped", stream.ChannelName, bufferType))
+			clientConnection(stream)
+			return
+		}
 
 		err = errors.New(bufferType + " error")
 		addErrorToStream(err)

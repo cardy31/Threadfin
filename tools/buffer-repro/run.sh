@@ -9,7 +9,7 @@
 # Usage: ./run.sh <threadfin image> [scenario ...]
 #   e.g. ./run.sh fyb3roptik/threadfin:latest
 #        ./run.sh threadfin:dev s2 s6
-# Scenarios: s1 s2 s3 s4 s5 s6 (default: all)
+# Scenarios: s1 s2 s3 s4 s5 s6 s7 (default: all)
 set -u
 IMAGE=${1:?usage: run.sh <threadfin image> [scenario ...]}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -49,9 +49,11 @@ http://tfrepro-src:8000/live/b.ts
 http://tfrepro-src:8000/stall/c.ts
 #EXTINF:-1 tvg-id="d" group-title="Repro",Hiccup D
 http://tfrepro-src:8000/hiccup/d.ts
+#EXTINF:-1 tvg-id="e" group-title="Repro",Start Stall E
+http://tfrepro-src:8000/startstall/e.ts
 EOF
 { echo '<?xml version="1.0" encoding="UTF-8"?>'; echo '<tv>'
-  for c in a b c d; do echo "  <channel id=\"$c\"><display-name>$c</display-name></channel>"
+  for c in a b c d e; do echo "  <channel id=\"$c\"><display-name>$c</display-name></channel>"
     echo "  <programme start=\"20200101000000 +0000\" stop=\"20991231000000 +0000\" channel=\"$c\"><title>$c</title></programme>"; done
   echo '</tv>'; } > "$WORK/conf/repro.xml"
 
@@ -81,7 +83,7 @@ echo "Threadfin under test: $(docker logs tfrepro-tf 2>&1 | grep -oE 'Version: +
 
 M3U=$(docker exec tfrepro-src wget -qO- http://tfrepro-tf:34400/m3u/threadfin.m3u)
 url() { echo "$M3U" | grep -A1 ",$1\$" | tail -1 | sed -E 's#http://[^/]+#http://tfrepro-tf:34400#'; }
-A=$(url "Live A"); B=$(url "Live B"); C=$(url "Stall C"); D=$(url "Hiccup D")
+A=$(url "Live A"); B=$(url "Live B"); C=$(url "Stall C"); D=$(url "Hiccup D"); E=$(url "Start Stall E")
 [ -n "$A" ] && [ -n "$D" ] || { echo "Threadfin did not serve the test channels"; exit 1; }
 
 # ---- helpers -------------------------------------------------------------
@@ -115,7 +117,7 @@ s4() { echo "S4 channel change during startup: A plays, B opens, A leaves before
   client c1 8 "$C"; sleep 3; state "C opened as 2nd stream"; sleep 10; state "C gone"; }
 
 s5() { echo "S5 source pauses 8 s mid-stream; viewer reconnects during the pause; data resumes"
-  client d1 14 "$D"; sleep 14.5; client d2 25 "$D"; sleep 12; state "after resume"; sleep 16; state "10 s after both left"; }
+  client d1 14 "$D"; sleep 14.5; client d2 25 "$D"; sleep 12; state "after resume"; sleep 23; state "10 s after both left"; }
 
 s6() { echo "S6 like S5, but the new connection opens 0.3 s before the old one closes (player retry)"
   client d1 14 "$D"; sleep 13.7
@@ -123,4 +125,7 @@ s6() { echo "S6 like S5, but the new connection opens 0.3 s before the old one c
   sleep 14; state "after resume"; wait
   echo "  second viewer received $(( $(cat "$WORK/d2.bytes") / 1024 )) KB"; sleep 3; state "after both left"; }
 
-for s in ${@:-s1 s2 s3 s4 s5 s6}; do reset; $s; summary; done
+s7() { echo "S7 source stalls before the first segment; viewer leaves at 5 s"
+  client e1 5 "$E"; sleep 3; state "stalled, still watching"; sleep 7; state "5 s after leaving"; sleep 20; state "25 s after leaving"; }
+
+for s in ${@:-s1 s2 s3 s4 s5 s6 s7}; do reset; $s; summary; done

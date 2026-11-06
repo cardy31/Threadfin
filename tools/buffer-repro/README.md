@@ -21,13 +21,14 @@ and temp files when it exits.
 
 ## What it does
 
-`fake_source.py` serves four channels:
+`fake_source.py` serves five channels:
 
 | Channel | Path | Behaviour |
 |---|---|---|
 | Live A, Live B | `/live/` | Loops a test clip at about 2 Mbps, forever. |
 | Stall C | `/stall/` | Sends about 3 MB, then sends nothing, but keeps the connection open. This is like a provider that hangs. |
 | Hiccup D | `/hiccup/` | Sends about 3 MB, pauses for 8 s, then continues. |
+| Start Stall E | `/startstall/` | Sends nothing, but keeps the connection open. This is like a provider that hangs before the first byte. |
 
 Threadfin is set up with the `ffmpeg` buffer, `tuner` 2, and
 `buffer.size.kb` 512. Each scenario restarts Threadfin. Clients are
@@ -44,6 +45,7 @@ Threadfin to the fake source.
 | S4 | Change channel while the new channel is still starting. |
 | S5 | The source pauses. The viewer reconnects during the pause, then data resumes. |
 | S6 | Like S5, but the new connection opens 0.3 s before the old one closes, as some players do on a retry. |
+| S7 | Watch a channel that stalls before the first segment, then leave. |
 
 ## Results on 1.2.37
 
@@ -58,6 +60,8 @@ connections):
 | S4 | correct (only the client still watching) | correct |
 | S5 | **1 / 1** (and 2 / 2 for one viewer while watching) | 0 / 0 (1 / 1 while watching) |
 | S6 | **1 / 1** (and 2 / 2 for one viewer while watching) | 0 / 0 (1 / 1 while watching) |
+
+S7 is 1 / 1 on stock (still open 25 s later), and 0 / 0 with the fix.
 
 In S6, the second viewer receives the same amount of data with and
 without the fix.

@@ -6,6 +6,8 @@ GET /hiccup/<name>.ts like /live, but pauses for HICCUP_SECS after
 GET /stall/<name>.ts  sends STALL_AFTER bytes at real time, then sends
                       nothing more but keeps the connection open, like a
                       provider that hangs mid-stream.
+GET /startstall/<name>.ts  sends nothing but keeps the connection open, like
+                      a provider that hangs before the first byte.
 Every request is logged with open/close, so the log shows how many
 upstream connections Threadfin holds at once.
 """
@@ -38,7 +40,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         stall = self.path.startswith("/stall/")
         hiccup = self.path.startswith("/hiccup/")
-        if not (stall or hiccup or self.path.startswith("/live/")):
+        startstall = self.path.startswith("/startstall/")
+        if not (stall or hiccup or startstall or self.path.startswith("/live/")):
             self.send_error(404)
             return
         key = id(self)
@@ -51,7 +54,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             sent, pos = 0, 0
             while True:
-                if stall and sent >= STALL_AFTER:
+                if startstall or (stall and sent >= STALL_AFTER):
                     time.sleep(1)          # hold the connection, send nothing
                     continue
                 if hiccup and STALL_AFTER <= sent < STALL_AFTER + CHUNK:

@@ -36,13 +36,25 @@ type BackupStream struct {
 var bufferGeneration atomic.Uint64
 
 // bufferRuns maps a buffer key (playlistID + stream MD5) to a channel that is
-// closed when the thirdPartyBuffer run for that key has stopped. A new run for
-// the same key waits on it, so two runs never write to the same buffer folder.
+// closed when the thirdPartyBuffer run for that key, and every older run for
+// that key, has stopped. A new run for the same key waits on it, so two runs
+// never write to the same buffer folder.
 var bufferRuns sync.Map
 
 // bufferWatchInterval is how often a thirdPartyBuffer run checks whether its
 // clients are gone, independently of whether ffmpeg/VLC is producing data.
 const bufferWatchInterval = 500 * time.Millisecond
+
+// bufferRunWaitTimeout is how long a new thirdPartyBuffer run waits for an older
+// run on the same stream to stop.
+const bufferRunWaitTimeout = 5 * time.Second
+
+// isCurrentBufferRun reports whether a thirdPartyBuffer run still owns its
+// stream: the stream has clients, and no newer run has replaced this one.
+func isCurrentBufferRun(bufferKey string, generation uint64) bool {
+	c, ok := BufferClients.Load(bufferKey)
+	return ok && c.(ClientConnection).Generation == generation
+}
 
 func getActiveClientCount() (count int) {
 	count = 0
@@ -404,6 +416,18 @@ func bufferingStream(playlistID string, streamingURL string, backupStream1 *Back
 			if stream, ok := playlist.Streams[streamID]; ok {
 
 				if !stream.Status {
+
+					// The buffer watchdog only sees a client leave once it is
+					// unregistered, so do that here too, before the first segment.
+					select {
+
+					case <-r.Context().Done():
+						killClientConnection(streamID, playlistID, false)
+						return
+
+					default:
+
+					}
 
 					timeOut++
 
@@ -1054,22 +1078,65 @@ func thirdPartyBuffer(streamID int, playlistID string, useBackup bool, backupNum
 		// clears and reuses the buffer folder. A backup run (useBackup) is
 		// called from inside the first run, so it must not wait on itself.
 		if !useBackup {
+			// Check and swap together, so that bufferRuns keeps the runs in
+			// generation order: a stale run never hides a newer one.
+			Lock.Lock()
+			if !isCurrentBufferRun(bufferKey, generation) {
+				Lock.Unlock()
+				return
+			}
 			var done = make(chan struct{})
-			if prev, loaded := bufferRuns.Swap(bufferKey, done); loaded {
+			var prev, loaded = bufferRuns.Swap(bufferKey, done)
+			Lock.Unlock()
+
+			// If the older run is still stopping when this run returns, done
+			// stays open until it has stopped, so the next run waits for it too.
+			defer func() {
+				go func() {
+					if loaded {
+						<-prev.(chan struct{})
+					}
+					close(done)
+					bufferRuns.CompareAndDelete(bufferKey, done)
+				}()
+			}()
+
+			var prevStopped = true
+			if loaded {
 				select {
 				case <-prev.(chan struct{}):
-				case <-time.After(5 * time.Second):
-					showInfo("Streaming Status:Previous buffer for this stream did not stop within 5s")
+				case <-time.After(bufferRunWaitTimeout):
+					prevStopped = false
 				}
 			}
-			defer func() {
-				close(done)
-				bufferRuns.CompareAndDelete(bufferKey, done)
-			}()
+
+			// During the wait, the clients left or a newer run replaced this
+			// run. Do not clear the folder or open an upstream connection.
+			if !isCurrentBufferRun(bufferKey, generation) {
+				if prevStopped {
+					clientConnection(stream)
+				}
+				return
+			}
+
+			// The older run may still be writing to the buffer folder, so do
+			// not share it. The clients stop on the error, and can reconnect.
+			if !prevStopped {
+				var err = errors.New("Previous buffer for this stream did not stop")
+				ShowError(err, 0)
+				Lock.Lock()
+				if c, ok := BufferClients.Load(bufferKey); ok {
+					var clients = c.(ClientConnection)
+					clients.Error = err
+					BufferClients.Store(bufferKey, clients)
+				}
+				Lock.Unlock()
+				return
+			}
 		}
 
-		var tmpFolder = playlist.Streams[streamID].Folder
-		var url = playlist.Streams[streamID].URL
+		var tmpFolder = stream.Folder
+		var url = stream.URL
 		if useBackup {
 			if backupNumber >= 1 && backupNumber <= 3 {
 				switch backupNumber {
